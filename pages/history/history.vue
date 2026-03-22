@@ -144,7 +144,9 @@ export default {
       chartOpts: {
         color: ["#409eff"],
         padding: [15, 15, 0, 5],
-        enableScroll: false,
+        enableScroll: false, // true:开启滚动；false:关闭滚动
+		dataLabel: false,  // true:开启图表上的数据值标签；false:关闭图表上的数据值标签
+		dataPointShape: false,  // true:显示所有数据点标识；false:隐藏所有数据点标识
 		legend: {
 			show: false,          // true:启用图例；false:关闭图例
 			position: 'top',     // 图例位置：top / bottom / left / right
@@ -162,7 +164,8 @@ export default {
         xAxis: {
           disableGrid: true,
           rotateLabel: true,
-          itemCount: 10,
+		  labelCount: 5,      // 强制只显示5个刻度标签
+		  itemCount: 300,     // 显示数据点数量
           fontSize: 10
         },
         yAxis: {
@@ -170,12 +173,11 @@ export default {
         },
         extra: {
           line: {
-            type: 'straight',
-			point: { show: false }  // 隐藏折线图上的数据点
+            type: 'straight'
           },
           column: {
             type: 'group',
-            width: 12
+            width: 2
           }
         }
       },
@@ -251,37 +253,36 @@ export default {
     },
     
     // 更新图表数据
-    updateChartData() {
-      if (this.historyList.length === 0) {
-        this.chartData = {};
-        return;
-      }
-      // 按测量时间升序排序
-      const sortedData = [...this.historyList].sort((a, b) => 
-        new Date(a.gmtMeasurement) - new Date(b.gmtMeasurement)
-      );
-      
-      // 限制数据点数量，避免图表过于拥挤（最多显示20个点）
-      const maxPoints = 15;
-      const step = Math.ceil(sortedData.length / maxPoints);
-      const sampledData = sortedData.filter((_, index) => index % step === 0).slice(0, maxPoints);
-      
-      const categories = sampledData.map(item => this.formatTimeShort(item.gmtMeasurement));
-      const seriesData = sampledData.map(item => {
-        const val = item[this.currentSensor];
-        return val !== undefined ? val : 0;
-      });
-      
-      this.chartData = {
-        categories: categories,
-        series: [{
-          name: this.currentSensorLabel+"("+this.currentUnit+")",
-          name: this.currentSensorLabel+"("+this.currentUnit+")",
-          data: seriesData
-        }]
-      };
-    },
-    
+	updateChartData() {
+	  if (this.historyList.length === 0) {
+	    this.chartData = {};
+	    return;
+	  }
+	 // 按测量时间升序排序
+	  const sortedData = [...this.historyList].sort((a, b) => 
+	    new Date(a.gmtMeasurement) - new Date(b.gmtMeasurement)
+	  );
+	 
+	  // 限制数据点数量，避免图表过于拥挤（最多显示20个点）
+	  const maxPoints = 300;
+	  const step = Math.ceil(sortedData.length / maxPoints);
+	  const sampledData = sortedData.filter((_, index) => index % step === 0).slice(0, maxPoints);
+	 
+	  const categories = sampledData.map(item => this.formatTimeShort(item.gmtMeasurement));
+	  const seriesData = sampledData.map(item => {
+	    const val = item[this.currentSensor];
+	    return val !== undefined ? val : 0;
+	  });
+	 
+	  this.chartData = {
+	    categories: categories,
+	    series: [{
+		  name: this.currentSensorLabel+"("+this.currentUnit+")",
+		  data: seriesData
+	    }]
+	  };
+	},
+
     updateDisplayList() {
       const start = 0;
       const end = this.currentPage * this.pageSize;
@@ -294,7 +295,6 @@ export default {
         this.updateDisplayList();
       }
     },
-    
     resetAndFetch() {
       this.fetchHistory();
     },

@@ -2,7 +2,7 @@
   <view class="profile-container">
     <view class="user-card">
       <view class="avatar-area">
-        <image class="avatar" :src="userInfo.avatar || '/static/default_avatar.png'" mode="aspectFill"></image>
+        <image class="avatar" :src="userInfo.avatar || '/static/default_avatar.jpg'" mode="aspectFill"></image>
         <view class="user-name">{{ userInfo.name || '用户' }}</view>
         <view class="user-account">账号：{{ userInfo.code }}</view>
       </view>

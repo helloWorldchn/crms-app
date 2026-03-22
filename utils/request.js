@@ -1,4 +1,4 @@
-const BASE_URL = 'http://localhost:8080'; // 替换为你的后端地址
+const BASE_URL = 'http://192.168.1.21:8080'; // 替换为你的后端地址
 
 const request = (options) => {
   return new Promise((resolve, reject) => {

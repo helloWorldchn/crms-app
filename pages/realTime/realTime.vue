@@ -7,12 +7,15 @@
         <text class="refresh-btn" @click="fetchData" :class="{loading: loading}">⟳ 刷新</text>
       </view>
       <view class="card-body">
-        <view v-if="loading && !environmentData" class="loading-mask">
-          <text>加载中...</text>
+        <view v-if="connecting && !environmentData" class="loading-mask">
+          <text>连接中...</text>
         </view>
         <view v-else-if="error" class="error-mask">
           <text>{{ error }}</text>
-          <text class="refresh-btn" @click="fetchData">重试</text>
+          <text class="refresh-btn" @click="reconnectWebSocket">重连</text>
+        </view>
+        <view v-else-if="!environmentData" class="loading-mask">
+          <text>等待数据推送...</text>
         </view>
         <view v-else>
           <!-- 第一行：温度、湿度 -->
@@ -117,12 +120,12 @@
             <view class="button-group">
               <button 
                 class="btn btn-primary" 
-                :disabled="fanLoading || (environmentData && environmentData.fanStatus === 1)"
+                :disabled="fanLoading || (pendingCommand && pendingCommand.deviceType === 'fan') || (environmentData && environmentData.fanStatus === 1)"
                 @click="controlRadiator('on')"
               >打开</button>
               <button 
                 class="btn btn-danger" 
-                :disabled="fanLoading || (environmentData && environmentData.fanStatus === 0)"
+                :disabled="fanLoading || (pendingCommand && pendingCommand.deviceType === 'fan') || (environmentData && environmentData.fanStatus === 0)"
                 @click="controlRadiator('off')"
               >关闭</button>
             </view>
@@ -139,16 +142,20 @@
             <view class="button-group">
               <button 
                 class="btn btn-primary" 
-                :disabled="ledLoading || (environmentData && environmentData.ledStatus === 1)"
+                :disabled="ledLoading || (pendingCommand && pendingCommand.deviceType === 'led') || (environmentData && environmentData.ledStatus === 1)"
                 @click="controlLed('on')"
               >打开</button>
               <button 
                 class="btn btn-danger" 
-                :disabled="ledLoading || (environmentData && environmentData.ledStatus === 0)"
+                :disabled="ledLoading || (pendingCommand && pendingCommand.deviceType === 'led') || (environmentData && environmentData.ledStatus === 0)"
                 @click="controlLed('off')"
               >关闭</button>
             </view>
           </view>
+        </view>
+        <!-- 等待指令提示 -->
+        <view v-if="pendingCommand" class="pending-tip">
+          <text>⏳ 等待设备响应 {{ pendingCommand.deviceType === 'fan' ? '散热器' : 'LED' }} {{ pendingCommand.action === 'on' ? '开启' : '关闭' }} 指令...</text>
         </view>
       </view>
     </view>
@@ -158,30 +165,58 @@
 <script>
 import request from '@/utils/request.js';
 
+// WebSocket 基础地址配置（请根据实际环境修改）
+// 开发环境: 'ws://localhost:8080/ws/environment/websocket'
+// 生产环境: 'wss://your-domain.com/ws/environment/websocket'
+const WS_BASE_URL = 'ws://192.168.1.21:8080/ws/environment/websocket';
+
 export default {
   data() {
     return {
-      environmentData: null,
-      loading: false,
-      error: null,
-      timer: null,
-      fanLoading: false,
-      ledLoading: false
+      environmentData: null,      // 环境数据
+      loading: false,             // HTTP刷新加载状态
+      error: null,                // 错误信息
+      
+      // WebSocket 相关
+      socketTask: null,           // WebSocket 连接实例
+      connecting: false,          // 是否正在连接中
+      reconnectTimer: null,       // 重连定时器
+      reconnectAttempts: 0,       // 重连次数
+      stompFrameBuffer: '',       // STOMP 帧接收缓冲区
+      
+      // 反控等待确认
+      pendingCommand: null,       // { deviceType, action }
+      commandTimeout: null,       // 超时定时器
+      fanLoading: false,          // 散热器指令发送中标志
+      ledLoading: false,           // LED指令发送中标志
+	  pollingTimer: null   // 轮询定时器
     };
   },
   onShow() {
-    // 页面显示时拉取数据并启动轮询
+    // 页面显示时：获取初始数据，连接WebSocket
     this.fetchData();
-    this.startPolling();
+    this.connectWebSocket();
   },
   onHide() {
-    // 页面隐藏时停止轮询，节省资源
-    this.stopPolling();
+    // 页面隐藏时断开WebSocket，停止重连
+    this.disconnectWebSocket();
+	this.stopPolling();   // 页面隐藏时停止轮询，节省资源
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.commandTimeout) {
+      clearTimeout(this.commandTimeout);
+      this.commandTimeout = null;
+    }
   },
   onUnload() {
-    this.stopPolling();
+    this.disconnectWebSocket();
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.commandTimeout) clearTimeout(this.commandTimeout);
   },
   methods: {
+    // ========== HTTP 初始数据获取 ==========
     async fetchData() {
       this.loading = true;
       this.error = null;
@@ -202,17 +237,247 @@ export default {
         this.loading = false;
       }
     },
+	startPolling() {
+	  if (this.pollingTimer) return;
+	  console.log('启用轮询降级');
+	  this.pollingTimer = setInterval(() => {
+		if (!this.loading) {
+		  this.fetchData();   // 复用原有的 HTTP 获取数据方法
+		}
+	  }, 5000);   // 5秒轮询
+	},
+
+	stopPolling() {
+	  if (this.pollingTimer) {
+		clearInterval(this.pollingTimer);
+		this.pollingTimer = null;
+		console.log('停止轮询');
+	  }
+	},
+    // ========== WebSocket STOMP 协议实现 ==========
+    connectWebSocket() {
+      if (this.socketTask && this.socketTask.readyState === 1) {
+        console.log('WebSocket 已连接，无需重复连接');
+        return;
+      }
+      if (this.connecting) return;
+      
+      this.connecting = true;
+      this.error = null;
+      
+      // 创建 WebSocket 连接
+      this.socketTask = uni.connectSocket({
+        url: WS_BASE_URL,
+        success: () => {
+          console.log('WebSocket 连接创建成功');
+        },
+        fail: (err) => {
+          console.error('WebSocket 连接创建失败', err);
+          this.handleConnectionError();
+        }
+      });
+      
+      // 监听打开事件
+      this.socketTask.onOpen(() => {
+        console.log('WebSocket 连接已打开');
+        this.connecting = false;
+        this.reconnectAttempts = 0;
+        // 连接成功后发送 STOMP CONNECT 帧
+        this.sendStompConnect();
+		this.stopPolling();        // 连接成功，停止轮询
+      });
+      
+      // 监听消息事件
+      this.socketTask.onMessage((res) => {
+        this.handleStompMessage(res.data);
+      });
+      
+      // 监听错误事件
+      this.socketTask.onError((err) => {
+        console.error('WebSocket 错误', err);
+        this.handleConnectionError();
+		this.startPolling();       // 连接错误，启动轮询降级
+      });
+      
+      // 监听关闭事件
+      this.socketTask.onClose(() => {
+        console.log('WebSocket 连接已关闭');
+        this.socketTask = null;
+        this.connecting = false;
+		this.startPolling();       // 连接关闭，启动轮询降级
+        // 非主动断开时尝试重连
+        if (this.reconnectTimer === null) {
+          this.reconnectWebSocket();
+        }
+      });
+    },
+    
+    // 发送 STOMP CONNECT 帧
+    sendStompConnect() {
+      const connectFrame = 'CONNECT\naccept-version:1.1,1.0\nheart-beat:10000,10000\n\n\0';
+      this.socketTask.send({
+        data: connectFrame,
+        fail: (err) => console.error('发送 CONNECT 失败', err)
+      });
+    },
+    
+    // 发送 STOMP SUBSCRIBE 帧
+    sendStompSubscribe() {
+      const subscribeFrame = 'SUBSCRIBE\nid:sub-0\ndestination:/topic/environment\nack:auto\n\n\0';
+      this.socketTask.send({
+        data: subscribeFrame,
+        fail: (err) => console.error('发送 SUBSCRIBE 失败', err)
+      });
+    },
+    
+    // 处理接收到的 STOMP 消息（解析帧）
+    handleStompMessage(data) {
+      // 将数据追加到缓冲区
+      this.stompFrameBuffer += data;
+      // 按帧结束符 \0 分割
+      let nullIndex;
+      while ((nullIndex = this.stompFrameBuffer.indexOf('\0')) !== -1) {
+        const frameStr = this.stompFrameBuffer.substring(0, nullIndex);
+        this.stompFrameBuffer = this.stompFrameBuffer.substring(nullIndex + 1);
+        if (frameStr.trim().length === 0) continue;
+        
+        // 解析帧
+        const lines = frameStr.split('\n');
+        const command = lines[0];
+        
+        // 处理 CONNECTED 响应
+        if (command === 'CONNECTED') {
+          console.log('STOMP 连接成功，发送订阅');
+          this.sendStompSubscribe();
+        }
+        // 处理 MESSAGE 帧
+        else if (command === 'MESSAGE') {
+          // 查找空行分隔的 body
+          const bodyStartIndex = frameStr.indexOf('\n\n');
+          if (bodyStartIndex !== -1) {
+            let body = frameStr.substring(bodyStartIndex + 2);
+            // 移除末尾的 \0 (已经在分割时去掉)
+            try {
+              const messageData = JSON.parse(body);
+              console.log('收到推送数据:', messageData);
+              this.environmentData = messageData;
+              if (this.error) this.error = null;
+              // 检查是否匹配等待的指令
+              this.checkPendingCommand(messageData);
+            } catch (e) {
+              console.error('解析推送 JSON 失败', e, body);
+            }
+          }
+        }
+        // 处理 ERROR 帧
+        else if (command === 'ERROR') {
+          console.error('STOMP 错误帧:', frameStr);
+          this.error = '实时数据连接出错，将尝试重连';
+          this.disconnectWebSocket();
+          this.reconnectWebSocket();
+        }
+        // 处理 RECEIPT 等可忽略
+      }
+    },
+    
+    // 检查推送数据是否匹配等待的指令
+    checkPendingCommand(data) {
+      if (!this.pendingCommand) return;
+      
+      const { deviceType, action } = this.pendingCommand;
+      let statusChanged = false;
+      
+      if (deviceType === 'fan') {
+        const newStatus = data.fanStatus;
+        const expected = action === 'on' ? 1 : 0;
+        if (newStatus === expected) statusChanged = true;
+      } else if (deviceType === 'led') {
+        const newStatus = data.ledStatus;
+        const expected = action === 'on' ? 1 : 0;
+        if (newStatus === expected) statusChanged = true;
+      }
+      
+      if (statusChanged) {
+        // 清除超时定时器
+        if (this.commandTimeout) {
+          clearTimeout(this.commandTimeout);
+          this.commandTimeout = null;
+        }
+        // 清除等待状态
+        const deviceName = deviceType === 'fan' ? '散热器' : 'LED';
+        uni.showToast({
+          title: `${deviceName}${action === 'on' ? '开启' : '关闭'}成功`,
+          icon: 'success'
+        });
+        this.pendingCommand = null;
+        // 重置对应的 loading 标志
+        if (deviceType === 'fan') this.fanLoading = false;
+        else this.ledLoading = false;
+      }
+    },
+    
+    // 处理连接错误并尝试重连
+    handleConnectionError() {
+      this.error = '实时数据连接失败，正在尝试重连...';
+      this.connecting = false;
+      if (this.socketTask) {
+        try {
+          this.socketTask.close({});
+        } catch (e) {}
+        this.socketTask = null;
+      }
+      this.reconnectWebSocket();
+    },
+    
+    // 指数退避重连
+    reconnectWebSocket() {
+      if (this.reconnectTimer) return;
+      const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+      console.log(`将在 ${delay}ms 后尝试重连 WebSocket`);
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectAttempts++;
+        this.connectWebSocket();
+        this.reconnectTimer = null;
+      }, delay);
+    },
+    
+    // 主动断开 WebSocket
+    disconnectWebSocket() {
+      if (this.socketTask) {
+        try {
+          // 发送 DISCONNECT 帧（可选）
+          const disconnectFrame = 'DISCONNECT\n\n\0';
+          this.socketTask.send({
+            data: disconnectFrame,
+            fail: () => {}
+          });
+          this.socketTask.close({});
+        } catch (e) {}
+        this.socketTask = null;
+      }
+      this.connecting = false;
+      this.stompFrameBuffer = '';
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+    },
+    
+    // ========== 设备反控 ==========
     async controlRadiator(action) {
       if (!this.environmentData) {
         uni.showToast({ title: '设备信息未加载', icon: 'none' });
         return;
       }
+      // 已有等待指令，不允许重复操作
+      if (this.pendingCommand) {
+        uni.showToast({ title: '请等待上一次指令执行完成', icon: 'none' });
+        return;
+      }
+      
       const deviceId = this.environmentData.deviceId;
-      const targetStatus = action === 'on' ? 1 : 0;
-      const oldStatus = this.environmentData.fanStatus;
-      // 乐观更新
-      this.environmentData.fanStatus = targetStatus;
       this.fanLoading = true;
+      
       try {
         const res = await request({
           url: '/service/deviceOption/control',
@@ -225,27 +490,41 @@ export default {
           timeout: 3000
         });
         if (res.code === 20000) {
-          uni.showToast({ title: `散热器${action === 'on' ? '开启' : '关闭'}成功`, icon: 'success' });
-          // 可选再次刷新确保同步，但乐观更新已改
+          // 设置等待确认
+          this.pendingCommand = { deviceType: 'fan', action };
+          uni.showToast({ title: '指令已发送，等待设备响应...', icon: 'none', duration: 2000 });
+          // 设置超时（5秒）
+          this.commandTimeout = setTimeout(() => {
+            if (this.pendingCommand && this.pendingCommand.deviceType === 'fan') {
+              uni.showToast({ title: '设备响应超时，请检查网络或设备状态', icon: 'none' });
+              this.pendingCommand = null;
+              this.fanLoading = false;
+              this.commandTimeout = null;
+            }
+          }, 5000);
         } else {
-          // 回滚
-          this.environmentData.fanStatus = oldStatus;
           uni.showToast({ title: res.msg || '操作失败', icon: 'none' });
+          this.fanLoading = false;
         }
       } catch (err) {
-        this.environmentData.fanStatus = oldStatus;
         uni.showToast({ title: err.msg || '控制超时或失败', icon: 'none' });
-      } finally {
         this.fanLoading = false;
       }
     },
+    
     async controlLed(action) {
-      if (!this.environmentData) return;
+      if (!this.environmentData) {
+        uni.showToast({ title: '设备信息未加载', icon: 'none' });
+        return;
+      }
+      if (this.pendingCommand) {
+        uni.showToast({ title: '请等待上一次指令执行完成', icon: 'none' });
+        return;
+      }
+      
       const deviceId = this.environmentData.deviceId;
-      const targetStatus = action === 'on' ? 1 : 0;
-      const oldStatus = this.environmentData.ledStatus;
-      this.environmentData.ledStatus = targetStatus;
       this.ledLoading = true;
+      
       try {
         const res = await request({
           url: '/service/deviceOption/control',
@@ -258,36 +537,29 @@ export default {
           timeout: 3000
         });
         if (res.code === 20000) {
-          uni.showToast({ title: `LED${action === 'on' ? '打开' : '关闭'}成功`, icon: 'success' });
+          this.pendingCommand = { deviceType: 'led', action };
+          uni.showToast({ title: '指令已发送，等待设备响应...', icon: 'none', duration: 2000 });
+          this.commandTimeout = setTimeout(() => {
+            if (this.pendingCommand && this.pendingCommand.deviceType === 'led') {
+              uni.showToast({ title: '设备响应超时，请检查网络或设备状态', icon: 'none' });
+              this.pendingCommand = null;
+              this.ledLoading = false;
+              this.commandTimeout = null;
+            }
+          }, 5000);
         } else {
-          this.environmentData.ledStatus = oldStatus;
           uni.showToast({ title: res.msg || '操作失败', icon: 'none' });
+          this.ledLoading = false;
         }
       } catch (err) {
-        this.environmentData.ledStatus = oldStatus;
-        uni.showToast({ title: err.msg || '控制超时', icon: 'none' });
-      } finally {
+        uni.showToast({ title: err.msg || '控制超时或失败', icon: 'none' });
         this.ledLoading = false;
-      }
-    },
-    startPolling() {
-      if (this.timer) clearInterval(this.timer);
-      this.timer = setInterval(() => {
-        // 页面可见时才拉取数据，避免后台频繁请求
-        if (!this.loading) {
-          this.fetchData();
-        }
-      }, 5000);
-    },
-    stopPolling() {
-      if (this.timer) {
-        clearInterval(this.timer);
-        this.timer = null;
       }
     }
   }
 };
 </script>
+
 <style scoped>
 /* 全局变量 */
 :root {
@@ -367,7 +639,6 @@ export default {
   margin-bottom: 24rpx;
 }
 
-/* 当屏幕宽度小于 500rpx 时改为单列 */
 @media (max-width: 500rpx) {
   .data-row {
     grid-template-columns: 1fr;
@@ -552,10 +823,6 @@ button[disabled] {
   gap: 20rpx;
 }
 
-.loading-mask text:first-child {
-  font-size: 40rpx;
-}
-
 .error-mask {
   color: var(--danger-color);
 }
@@ -567,45 +834,15 @@ button[disabled] {
   border-radius: 80rpx;
   margin-top: 16rpx;
 }
-</style>
 
-<!-- <style scoped>
-/* 复用全局卡片样式，补充细节 */
-.fan-icon, .led-icon {
-  font-size: 44px;
-  display: inline-block;
+/* 等待指令提示 */
+.pending-tip {
+  margin-top: 20rpx;
+  padding: 16rpx;
+  background-color: #fdf6ec;
+  border-radius: var(--border-radius-md);
+  text-align: center;
+  font-size: 26rpx;
+  color: var(--warning-color);
 }
-.fan-animate {
-  animation: spin 1s linear infinite;
-}
-@keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-.led-on-glow {
-  text-shadow: 0 0 8px #ffb347;
-}
-.refresh-btn.loading {
-  opacity: 0.6;
-}
-.btn {
-  background-color: #fff;
-  border: 1px solid #dcdfe6;
-  padding: 6px 18px;
-  font-size: 13px;
-  border-radius: 30px;
-}
-.btn-primary {
-  background-color: #409eff;
-  border-color: #409eff;
-  color: #fff;
-}
-.btn-danger {
-  background-color: #f56c6c;
-  border-color: #f56c6c;
-  color: #fff;
-}
-button[disabled] {
-  opacity: 0.5;
-}
-</style> -->
+</style>

@@ -153,6 +153,7 @@ export default {
       selectedIndex: -1,        // picker 选中索引
       selectedDeviceLabel: '',  // 当前显示的标签
       deviceLoading: false,     // 设备列表加载中
+      defaultDeviceKey: null,   // 用户设置的默认设备Key
       searchKeyword: '',        // 搜索关键词（可选）
       searchTimer: null,        // 搜索防抖定时器
 
@@ -248,19 +249,65 @@ export default {
       this.resetAndFetch();
     }
   },
-  mounted() {
-    // 页面挂载时加载设备列表，加载完成后自动选中第一个设备（在 fetchDeviceList 中处理）
-    this.fetchDeviceList();
+  // async mounted() {
+  //   // 页面挂载时：先获取默认设备，再加载设备列表
+  //   await this.fetchDefaultDevice();
+  //   this.fetchDeviceList();
+  // },
+  onLoad() {
+	  // 页面首次加载时初始化
+	  this.initData();
   },
   onShow() {
     // 每次显示时，如果已有设备但设备列表可能变化，可重新加载（可选）
-    // 为避免频繁刷新，可保留此逻辑，但注意防抖
+    // 为避免频繁刷新，可保留此逻辑，但注意防抖  // 每次显示页面时都重新加载（包括tab切换）
+	this.initData();
     // this.fetchDeviceList();
   },
   onHide() {
     if (this.searchTimer) clearTimeout(this.searchTimer);
   },
   methods: {
+	async initData() {
+	  await this.fetchDefaultDevice();
+	  this.fetchDeviceList();
+	},
+    // ========== 默认设备相关 ==========
+    // 获取用户默认设备
+    async fetchDefaultDevice() {
+      try {
+        const res = await request({
+          url: '/service/device/default/getDefaultDevice',
+          method: 'GET'
+        });
+        if (res.code === 20000 && res.data && res.data.deviceKey) {
+          this.defaultDeviceKey = res.data.deviceKey;
+        } else {
+          this.defaultDeviceKey = null;
+        }
+      } catch (err) {
+        console.error('获取默认设备失败', err);
+        this.defaultDeviceKey = null;
+      }
+    },
+
+    // 设置用户默认设备
+    async setDefaultDevice(deviceKey) {
+      if (!deviceKey) return;
+      try {
+        await request({
+          url: '/service/device/default/setDefaultDevice',
+          method: 'POST',
+          data: { deviceKey: deviceKey }
+        });
+        // 设置成功，更新本地缓存的默认设备
+        this.defaultDeviceKey = deviceKey;
+      } catch (err) {
+        console.error('设置默认设备失败', err);
+        // 设置失败不影响主流程，静默处理或提示
+      }
+    },
+
     // ========== 设备列表 ==========
     async fetchDeviceList(keyword = '') {
       this.deviceLoading = true;
@@ -284,12 +331,33 @@ export default {
           label: `${item.deviceName || '未命名'} (${item.deviceKey})`
         }));
 
-        // 默认选中第一个设备
-        if (this.deviceOptions.length > 0 && !this.selectedDeviceKey) {
-          const first = this.deviceOptions[0];
-          this.selectedDeviceKey = first.value;
-          this.selectedIndex = 0;
-          this.selectedDeviceLabel = first.label;
+        // 优先选中默认设备，如果没有默认设备则选中第一个
+        if (this.deviceOptions.length > 0) {
+          let targetDevice = null;
+          let targetIndex = -1;
+
+          // 1. 尝试查找默认设备
+          if (this.defaultDeviceKey) {
+            const defaultIndex = this.deviceOptions.findIndex(
+              item => item.value === this.defaultDeviceKey
+            );
+            if (defaultIndex !== -1) {
+              targetIndex = defaultIndex;
+              targetDevice = this.deviceOptions[defaultIndex];
+            }
+          }
+
+          // 2. 没有默认设备或默认设备不在列表中，选第一个
+          if (!targetDevice) {
+            targetIndex = 0;
+            targetDevice = this.deviceOptions[0];
+            // 同时更新默认设备
+            this.setDefaultDevice(targetDevice.value);
+          }
+
+          this.selectedDeviceKey = targetDevice.value;
+          this.selectedIndex = targetIndex;
+          this.selectedDeviceLabel = targetDevice.label;
           this.onDeviceChange(this.selectedDeviceKey);
         } else {
           // 没有设备时清空
@@ -327,7 +395,9 @@ export default {
         this.selectedDeviceKey = selected.value;
         this.selectedIndex = idx;
         this.selectedDeviceLabel = selected.label;
-        this.onDeviceChange(this.selectedDeviceKey);
+        this.onDeviceChange(selected.value);
+        // 用户手动选择设备后，更新默认设备
+        this.setDefaultDevice(selected.value);
       } else {
         this.selectedDeviceKey = null;
         this.selectedIndex = -1;

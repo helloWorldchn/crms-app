@@ -19,17 +19,6 @@
             <text class="arrow">▼</text>
           </view>
         </picker>
-        <!-- 搜索框（可选，用于远程搜索） -->
-<!--        <view class="search-box">
-          <input
-            type="text"
-            v-model="searchKeyword"
-            placeholder="输入设备ID或名称搜索"
-            @confirm="searchDevices"
-            @input="onSearchInput"
-          />
-          <button @click="searchDevices" size="mini" type="primary">搜索</button>
-        </view> -->
       </view>
     </view>
 
@@ -52,15 +41,15 @@
         <view v-if="!selectedDeviceKey" class="loading-mask">
           <text>请先选择设备</text>
         </view>
-        <view v-else-if="connecting && !environmentData" class="loading-mask">
-          <text>连接中...</text>
+        <view v-else-if="loading && !environmentData" class="loading-mask">
+          <text>加载中...</text>
         </view>
         <view v-else-if="error" class="error-mask">
           <text>{{ error }}</text>
-          <text class="refresh-btn" @click="reconnectWebSocket">重连</text>
+          <text class="refresh-btn" @click="fetchData">重试</text>
         </view>
         <view v-else-if="!environmentData" class="loading-mask">
-          <text>等待数据推送...</text>
+          <text>暂无数据</text>
         </view>
         <view v-else>
 
@@ -223,8 +212,6 @@ export default {
       selectedIndex: -1,        // picker 选中索引
       selectedDeviceLabel: '',  // 当前显示的标签
       deviceLoading: false,     // 设备列表加载中
-      searchKeyword: '',        // 搜索关键词
-      searchTimer: null,        // 搜索防抖定时器
 
       environmentData: null,
       loading: false,
@@ -242,32 +229,31 @@ export default {
       commandTimeout: null,
       fanLoading: false,
       ledLoading: false,
-      pollingTimer: null,
-
-      // 数据超时降级
-      dataTimeoutTimer: null,
-      dataTimeoutDuration: 10000, // 10秒无数据则降级
-      fallbackLock: false         // 防止重复降级
+      pollingTimer: null
     };
   },
   onShow() {
     // 页面显示：加载设备列表
-    this.fetchDeviceList();
+    this.init();
   },
   onHide() {
     this.disconnectWebSocket();
     this.stopPolling();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.commandTimeout) clearTimeout(this.commandTimeout);
-    this.stopDataTimeoutTimer();
   },
   onUnload() {
     this.disconnectWebSocket();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.commandTimeout) clearTimeout(this.commandTimeout);
-    this.stopDataTimeoutTimer();
   },
   methods: {
+    // ==================== 初始化 ====================
+    async init() {
+      await this.fetchDeviceList();        // 获取设备列表
+      await this.loadDefaultDevice();      // 获取默认设备
+    },
+
     // ========== 设备列表相关 ==========
     async fetchDeviceList(keyword = '') {
       this.deviceLoading = true;
@@ -282,8 +268,6 @@ export default {
             value: item.deviceKey,
             label: `${item.deviceName || '未命名'} (${item.deviceKey})`
           }));
-          // 初始化设备选择（记忆/降级）
-          this.initializeDeviceSelection();
         } else {
           uni.showToast({ title: res.msg || '获取设备列表失败', icon: 'none' });
         }
@@ -295,57 +279,66 @@ export default {
       }
     },
 
-    // 初始化设备选择：根据记忆和降级策略设置选中设备
-    initializeDeviceSelection() {
+    // 从后端获取默认设备
+    async loadDefaultDevice() {
       if (this.deviceOptions.length === 0) {
-        // 无设备时清空选中
         this.selectedDeviceKey = null;
         this.selectedIndex = -1;
         this.selectedDeviceLabel = '';
-        this.environmentData = null;
-        this.disconnectWebSocket();
         return;
       }
 
-      const lastDevice = uni.getStorageSync('lastSelectedDevice');
-      let targetDevice = null;
-      let needFallbackTip = false;
-
-      // 检查记忆设备是否存在
-      if (lastDevice && this.deviceOptions.some(d => d.value === lastDevice)) {
-        targetDevice = lastDevice;
+      try {
+        const res = await request({
+          url: '/service/device/default/getDefaultDevice',
+          method: 'GET'
+        });
+        
+        // 判断返回是否成功且有设备Key
+        if (res.code === 20000 && res.data && res.data.deviceKey) {
+          const defaultDeviceKey = res.data.deviceKey;
+          // 检查该设备是否存在于当前设备列表中
+          if (this.deviceOptions.some(device => device.value === defaultDeviceKey)) {
+            this.selectedDeviceKey = defaultDeviceKey;
+            this.selectedIndex = this.deviceOptions.findIndex(d => d.value === defaultDeviceKey);
+            this.selectedDeviceLabel = this.deviceOptions[this.selectedIndex]?.label || '';
+            this.onDeviceChange(this.selectedDeviceKey);
+            return;
+          }
+        }
+      } catch (err) {
+        console.error('获取默认设备失败', err);
+      }
+      
+      // 如果默认设备获取失败或设备不存在，使用设备列表第一个
+      if (this.deviceOptions.length > 0) {
+        const firstDevice = this.deviceOptions[0].value;
+        this.selectedDeviceKey = firstDevice;
+        this.selectedIndex = 0;
+        this.selectedDeviceLabel = this.deviceOptions[0].label;
+        this.onDeviceChange(this.selectedDeviceKey);
+        // 异步保存为默认设备（首次使用）
+        this.setDefaultDevice(firstDevice);
       } else {
-        // 记忆设备不存在，选择最活跃设备（列表第一个）
-        targetDevice = this.deviceOptions[0].value;
-        if (lastDevice) {
-          needFallbackTip = true;
-        }
-      }
-
-      // 如果当前选中的设备与目标不同，则切换
-      if (this.selectedDeviceKey !== targetDevice) {
-        this.selectedDeviceKey = targetDevice;
-        this.selectedIndex = this.deviceOptions.findIndex(d => d.value === targetDevice);
-        this.selectedDeviceLabel = this.deviceOptions[this.selectedIndex]?.label || '';
-        this.onDeviceChange(this.selectedDeviceKey);
-        if (needFallbackTip) {
-          uni.showToast({ title: '您上次选择的设备已不可用，已为您切换到最新设备', icon: 'none', duration: 2000 });
-        }
-      } else if (this.selectedDeviceKey && !this.environmentData) {
-        // 已有选中但无数据，触发数据加载
-        this.onDeviceChange(this.selectedDeviceKey);
+        this.selectedDeviceKey = null;
+        this.selectedIndex = -1;
+        this.selectedDeviceLabel = '';
       }
     },
 
-    // 远程搜索（防抖）
-    searchDevices() {
-      this.fetchDeviceList(this.searchKeyword);
-    },
-    onSearchInput(e) {
-      clearTimeout(this.searchTimer);
-      this.searchTimer = setTimeout(() => {
-        this.searchDevices();
-      }, 300);
+    // 保存默认设备到后端
+    async setDefaultDevice(deviceKey) {
+      if (!deviceKey) return;
+      try {
+        await request({
+          url: '/service/device/default/setDefaultDevice',
+          method: 'POST',
+          data: { deviceKey }
+        });
+      } catch (err) {
+        console.error('保存默认设备失败', err);
+        // 静默失败，不影响主要功能
+      }
     },
 
     // picker 选择变化
@@ -368,20 +361,17 @@ export default {
 
     // 切换设备时的核心逻辑
     onDeviceChange(deviceKey) {
-      // 清空降级锁
-      this.fallbackLock = false;
       if (!deviceKey) {
         // 清空所有数据，断开连接
         this.environmentData = null;
         this.error = null;
         this.disconnectWebSocket();
         this.stopPolling();
-        this.stopDataTimeoutTimer();
-        uni.removeStorageSync('lastSelectedDevice');
         return;
       }
-      // 保存用户选择
-      uni.setStorageSync('lastSelectedDevice', deviceKey);
+      
+      // 保存为默认设备（后端同步）
+      this.setDefaultDevice(deviceKey);
 
       // 重置状态
       this.environmentData = null;
@@ -389,10 +379,6 @@ export default {
 
       // 断开旧连接
       this.disconnectWebSocket();
-      // 停止旧的数据超时定时器
-      this.stopDataTimeoutTimer();
-      // 启动新的数据超时检测
-      this.startDataTimeoutTimer();
 
       // 获取新设备数据（HTTP）
       this.fetchData();
@@ -414,94 +400,18 @@ export default {
         });
         if (res && res.data) {
           this.environmentData = res.data;
-          // 收到数据，重置超时计时器
-          this.resetDataTimeoutTimer();
         } else {
-          throw new Error('数据格式错误');
+          // 接口返回成功但无数据
+          this.environmentData = null;
+          this.error = null;
         }
       } catch (err) {
         console.error('获取实时数据失败', err);
-        // 如果错误提示设备不存在，触发降级
-        if (err.msg && (err.msg.includes('不存在') || err.msg.includes('已删除'))) {
-          this.handleDeviceInvalid();
-        } else {
-          this.error = err.msg || '获取数据失败，请检查网络';
-        }
+        this.error = err.msg || '获取数据失败，请检查网络';
+        this.environmentData = null;
       } finally {
         this.loading = false;
       }
-    },
-
-    // 处理设备无效的情况（被删除或不存在）
-    handleDeviceInvalid() {
-      if (this.fallbackLock) return;
-      this.fallbackLock = true;
-      uni.showToast({ title: '当前设备可能已被删除，正在为您切换到可用设备', icon: 'none', duration: 2000 });
-      // 刷新设备列表后重新选择最活跃设备
-      this.fetchDeviceList().then(() => {
-        if (this.deviceOptions.length > 0) {
-          const mostActive = this.deviceOptions[0].value;
-          if (mostActive !== this.selectedDeviceKey) {
-            this.selectedDeviceKey = mostActive;
-            this.selectedIndex = 0;
-            this.selectedDeviceLabel = this.deviceOptions[0].label;
-            this.onDeviceChange(this.selectedDeviceKey);
-          }
-        }
-        this.fallbackLock = false;
-      }).catch(() => {
-        this.fallbackLock = false;
-      });
-    },
-
-    // 启动数据超时检测（10秒无数据自动降级）
-    startDataTimeoutTimer() {
-      this.stopDataTimeoutTimer();
-      this.dataTimeoutTimer = setTimeout(() => {
-        this.onDataTimeout();
-      }, this.dataTimeoutDuration);
-    },
-
-    // 重置数据超时检测（收到数据时调用）
-    resetDataTimeoutTimer() {
-      if (this.dataTimeoutTimer) {
-        clearTimeout(this.dataTimeoutTimer);
-        this.dataTimeoutTimer = setTimeout(() => {
-          this.onDataTimeout();
-        }, this.dataTimeoutDuration);
-      }
-    },
-
-    // 停止数据超时检测
-    stopDataTimeoutTimer() {
-      if (this.dataTimeoutTimer) {
-        clearTimeout(this.dataTimeoutTimer);
-        this.dataTimeoutTimer = null;
-      }
-    },
-
-    // 数据超时回调：切换到最活跃设备
-    onDataTimeout() {
-      if (this.fallbackLock) return;
-      if (!this.selectedDeviceKey || this.deviceOptions.length === 0) return;
-
-      const mostActiveKey = this.deviceOptions[0].value;
-      // 如果当前设备就是最活跃设备，不再切换，但给出提示
-      if (this.selectedDeviceKey === mostActiveKey) {
-        uni.showToast({ title: '当前设备长时间无数据，请检查设备状态', icon: 'none', duration: 2000 });
-        return;
-      }
-
-      this.fallbackLock = true;
-      uni.showToast({ title: '当前设备长时间无数据，已为您切换到最新活跃设备', icon: 'none', duration: 2000 });
-      this.selectedDeviceKey = mostActiveKey;
-      this.selectedIndex = 0;
-      this.selectedDeviceLabel = this.deviceOptions[0].label;
-      this.onDeviceChange(this.selectedDeviceKey);
-      // 延迟解锁，避免短时间内重复触发
-      setTimeout(() => {
-        this.fallbackLock = false;
-      }, 2000);
     },
 
     // ========== WebSocket 连接与订阅 ==========
@@ -557,11 +467,13 @@ export default {
     },
 
     sendStompConnect() {
+      if (!this.socketTask) return;
       const connectFrame = 'CONNECT\naccept-version:1.1,1.0\nheart-beat:10000,10000\n\n\0';
       this.socketTask.send({ data: connectFrame, fail: (err) => console.error('发送 CONNECT 失败', err) });
     },
 
     sendStompSubscribe() {
+      if (!this.socketTask) return;
       // 动态订阅当前设备的主题
       const topic = `/topic/environment/${this.selectedDeviceKey}`;
       const subscribeFrame = `SUBSCRIBE\nid:sub-0\ndestination:${topic}\nack:auto\n\n\0`;
@@ -590,8 +502,6 @@ export default {
               const messageData = JSON.parse(body);
               console.log('收到推送数据:', messageData);
               this.environmentData = messageData;
-              // 收到推送数据，重置超时计时器
-              this.resetDataTimeoutTimer();
               if (this.error) this.error = null;
               this.checkPendingCommand(messageData);
             } catch (e) {
@@ -772,7 +682,7 @@ export default {
 </script>
 
 <style scoped>
-/* 原有样式保持不变，新增空设备卡片样式 */
+/* 样式保持不变（与之前相同） */
 .device-card {
   margin-bottom: 20rpx;
 }
@@ -788,23 +698,6 @@ export default {
 .arrow {
   font-size: 24rpx;
   color: #999;
-}
-.search-box {
-  display: flex;
-  margin-top: 20rpx;
-  gap: 20rpx;
-}
-.search-box input {
-  flex: 1;
-  background-color: #f5f5f5;
-  padding: 16rpx 24rpx;
-  border-radius: 48rpx;
-  font-size: 28rpx;
-}
-.search-box button {
-  width: auto;
-  padding: 0 24rpx;
-  font-size: 28rpx;
 }
 .empty-card {
   margin-top: 20rpx;

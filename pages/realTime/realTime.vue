@@ -1,13 +1,58 @@
 <template>
   <view class="container">
-    <!-- 实时数据卡片 -->
-    <view class="card">
+    <!-- 设备选择卡片 -->
+    <view class="card device-card">
+      <view class="card-header">
+        <text>设备选择</text>
+      </view>
+      <view class="card-body">
+        <picker
+          mode="selector"
+          :range="deviceOptions"
+          :range-key="'label'"
+          :value="selectedIndex"
+          @change="onDevicePickerChange"
+          :disabled="deviceLoading"
+        >
+          <view class="picker-display">
+            <text>{{ selectedDeviceKey ? (selectedDeviceLabel || '请选择设备') : '请选择设备' }}</text>
+            <text class="arrow">▼</text>
+          </view>
+        </picker>
+        <!-- 搜索框（可选，用于远程搜索） -->
+<!--        <view class="search-box">
+          <input
+            type="text"
+            v-model="searchKeyword"
+            placeholder="输入设备ID或名称搜索"
+            @confirm="searchDevices"
+            @input="onSearchInput"
+          />
+          <button @click="searchDevices" size="mini" type="primary">搜索</button>
+        </view> -->
+      </view>
+    </view>
+
+    <!-- 空设备提示 -->
+    <view v-if="deviceOptions.length === 0" class="card empty-card">
+      <view class="card-body empty-device-wrapper">
+        <text class="empty-icon">⚠️</text>
+        <text class="empty-text">暂无可用设备，请先添加设备</text>
+        <button class="btn btn-primary refresh-list-btn" @click="fetchDeviceList">刷新列表</button>
+      </view>
+    </view>
+
+    <!-- 实时数据卡片（仅当有设备时显示） -->
+    <view v-else class="card">
       <view class="card-header">
         <text>实时环境监测</text>
         <text class="refresh-btn" @click="fetchData" :class="{loading: loading}">⟳ 刷新</text>
       </view>
       <view class="card-body">
-        <view v-if="connecting && !environmentData" class="loading-mask">
+        <view v-if="!selectedDeviceKey" class="loading-mask">
+          <text>请先选择设备</text>
+        </view>
+        <view v-else-if="connecting && !environmentData" class="loading-mask">
           <text>连接中...</text>
         </view>
         <view v-else-if="error" class="error-mask">
@@ -18,6 +63,7 @@
           <text>等待数据推送...</text>
         </view>
         <view v-else>
+
           <!-- 第一行：温度、湿度 -->
           <view class="data-row">
             <view class="info-item">
@@ -103,8 +149,8 @@
       </view>
     </view>
 
-    <!-- 设备反控卡片 -->
-    <view class="card">
+    <!-- 设备反控卡片（仅当有设备时显示） -->
+    <view v-if="deviceOptions.length > 0" class="card">
       <view class="card-header">
         <text>设备反控</text>
       </view>
@@ -165,228 +211,406 @@
 <script>
 import request from '@/utils/request.js';
 
-// WebSocket 基础地址配置（请根据实际环境修改）
-// 开发环境: 'ws://localhost:8080/ws/environment/websocket'
-// 生产环境: 'wss://your-domain.com/ws/environment/websocket'
+// WebSocket 基础地址（需要支持动态订阅主题）
 const WS_BASE_URL = 'ws://192.168.1.21:8080/ws/environment/websocket';
 
 export default {
   data() {
     return {
-      environmentData: null,      // 环境数据
-      loading: false,             // HTTP刷新加载状态
-      error: null,                // 错误信息
-      
+      // 设备相关
+      deviceOptions: [],        // [{ value: 'deviceKey', label: 'deviceName - deviceKey' }]
+      selectedDeviceKey: null,  // 当前选中的设备Key
+      selectedIndex: -1,        // picker 选中索引
+      selectedDeviceLabel: '',  // 当前显示的标签
+      deviceLoading: false,     // 设备列表加载中
+      searchKeyword: '',        // 搜索关键词
+      searchTimer: null,        // 搜索防抖定时器
+
+      environmentData: null,
+      loading: false,
+      error: null,
+
       // WebSocket 相关
-      socketTask: null,           // WebSocket 连接实例
-      connecting: false,          // 是否正在连接中
-      reconnectTimer: null,       // 重连定时器
-      reconnectAttempts: 0,       // 重连次数
-      stompFrameBuffer: '',       // STOMP 帧接收缓冲区
-      
+      socketTask: null,
+      connecting: false,
+      reconnectTimer: null,
+      reconnectAttempts: 0,
+      stompFrameBuffer: '',
+
       // 反控等待确认
-      pendingCommand: null,       // { deviceType, action }
-      commandTimeout: null,       // 超时定时器
-      fanLoading: false,          // 散热器指令发送中标志
-      ledLoading: false,           // LED指令发送中标志
-	  pollingTimer: null   // 轮询定时器
+      pendingCommand: null,
+      commandTimeout: null,
+      fanLoading: false,
+      ledLoading: false,
+      pollingTimer: null,
+
+      // 数据超时降级
+      dataTimeoutTimer: null,
+      dataTimeoutDuration: 10000, // 10秒无数据则降级
+      fallbackLock: false         // 防止重复降级
     };
   },
   onShow() {
-    // 页面显示时：获取初始数据，连接WebSocket
-    this.fetchData();
-    this.connectWebSocket();
+    // 页面显示：加载设备列表
+    this.fetchDeviceList();
   },
   onHide() {
-    // 页面隐藏时断开WebSocket，停止重连
     this.disconnectWebSocket();
-	this.stopPolling();   // 页面隐藏时停止轮询，节省资源
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.commandTimeout) {
-      clearTimeout(this.commandTimeout);
-      this.commandTimeout = null;
-    }
+    this.stopPolling();
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.commandTimeout) clearTimeout(this.commandTimeout);
+    this.stopDataTimeoutTimer();
   },
   onUnload() {
     this.disconnectWebSocket();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.commandTimeout) clearTimeout(this.commandTimeout);
+    this.stopDataTimeoutTimer();
   },
   methods: {
-    // ========== HTTP 初始数据获取 ==========
+    // ========== 设备列表相关 ==========
+    async fetchDeviceList(keyword = '') {
+      this.deviceLoading = true;
+      try {
+        const res = await request({
+          url: '/service/device/getDeviceSelect',
+          method: 'GET',
+          data: keyword ? { keyword } : {}
+        });
+        if (res.code === 20000) {
+          this.deviceOptions = (res.data || []).map(item => ({
+            value: item.deviceKey,
+            label: `${item.deviceName || '未命名'} (${item.deviceKey})`
+          }));
+          // 初始化设备选择（记忆/降级）
+          this.initializeDeviceSelection();
+        } else {
+          uni.showToast({ title: res.msg || '获取设备列表失败', icon: 'none' });
+        }
+      } catch (err) {
+        console.error('获取设备列表失败', err);
+        uni.showToast({ title: '网络异常，获取设备列表失败', icon: 'none' });
+      } finally {
+        this.deviceLoading = false;
+      }
+    },
+
+    // 初始化设备选择：根据记忆和降级策略设置选中设备
+    initializeDeviceSelection() {
+      if (this.deviceOptions.length === 0) {
+        // 无设备时清空选中
+        this.selectedDeviceKey = null;
+        this.selectedIndex = -1;
+        this.selectedDeviceLabel = '';
+        this.environmentData = null;
+        this.disconnectWebSocket();
+        return;
+      }
+
+      const lastDevice = uni.getStorageSync('lastSelectedDevice');
+      let targetDevice = null;
+      let needFallbackTip = false;
+
+      // 检查记忆设备是否存在
+      if (lastDevice && this.deviceOptions.some(d => d.value === lastDevice)) {
+        targetDevice = lastDevice;
+      } else {
+        // 记忆设备不存在，选择最活跃设备（列表第一个）
+        targetDevice = this.deviceOptions[0].value;
+        if (lastDevice) {
+          needFallbackTip = true;
+        }
+      }
+
+      // 如果当前选中的设备与目标不同，则切换
+      if (this.selectedDeviceKey !== targetDevice) {
+        this.selectedDeviceKey = targetDevice;
+        this.selectedIndex = this.deviceOptions.findIndex(d => d.value === targetDevice);
+        this.selectedDeviceLabel = this.deviceOptions[this.selectedIndex]?.label || '';
+        this.onDeviceChange(this.selectedDeviceKey);
+        if (needFallbackTip) {
+          uni.showToast({ title: '您上次选择的设备已不可用，已为您切换到最新设备', icon: 'none', duration: 2000 });
+        }
+      } else if (this.selectedDeviceKey && !this.environmentData) {
+        // 已有选中但无数据，触发数据加载
+        this.onDeviceChange(this.selectedDeviceKey);
+      }
+    },
+
+    // 远程搜索（防抖）
+    searchDevices() {
+      this.fetchDeviceList(this.searchKeyword);
+    },
+    onSearchInput(e) {
+      clearTimeout(this.searchTimer);
+      this.searchTimer = setTimeout(() => {
+        this.searchDevices();
+      }, 300);
+    },
+
+    // picker 选择变化
+    onDevicePickerChange(e) {
+      const idx = e.detail.value;
+      if (idx >= 0 && idx < this.deviceOptions.length) {
+        const selected = this.deviceOptions[idx];
+        this.selectedDeviceKey = selected.value;
+        this.selectedIndex = idx;
+        this.selectedDeviceLabel = selected.label;
+        this.onDeviceChange(this.selectedDeviceKey);
+      } else {
+        // 清空选择
+        this.selectedDeviceKey = null;
+        this.selectedIndex = -1;
+        this.selectedDeviceLabel = '';
+        this.onDeviceChange(null);
+      }
+    },
+
+    // 切换设备时的核心逻辑
+    onDeviceChange(deviceKey) {
+      // 清空降级锁
+      this.fallbackLock = false;
+      if (!deviceKey) {
+        // 清空所有数据，断开连接
+        this.environmentData = null;
+        this.error = null;
+        this.disconnectWebSocket();
+        this.stopPolling();
+        this.stopDataTimeoutTimer();
+        uni.removeStorageSync('lastSelectedDevice');
+        return;
+      }
+      // 保存用户选择
+      uni.setStorageSync('lastSelectedDevice', deviceKey);
+
+      // 重置状态
+      this.environmentData = null;
+      this.error = null;
+
+      // 断开旧连接
+      this.disconnectWebSocket();
+      // 停止旧的数据超时定时器
+      this.stopDataTimeoutTimer();
+      // 启动新的数据超时检测
+      this.startDataTimeoutTimer();
+
+      // 获取新设备数据（HTTP）
+      this.fetchData();
+
+      // 建立新 WebSocket 连接（订阅该设备主题）
+      this.connectWebSocket();
+    },
+
+    // ========== 数据获取 ==========
     async fetchData() {
+      if (!this.selectedDeviceKey) return;
       this.loading = true;
       this.error = null;
       try {
         const res = await request({
           url: '/service/environment/getLastEnvironment',
-          method: 'GET'
+          method: 'GET',
+          data: { deviceKey: this.selectedDeviceKey }
         });
         if (res && res.data) {
           this.environmentData = res.data;
+          // 收到数据，重置超时计时器
+          this.resetDataTimeoutTimer();
         } else {
           throw new Error('数据格式错误');
         }
       } catch (err) {
         console.error('获取实时数据失败', err);
-        this.error = err.msg || '获取数据失败，请检查网络';
+        // 如果错误提示设备不存在，触发降级
+        if (err.msg && (err.msg.includes('不存在') || err.msg.includes('已删除'))) {
+          this.handleDeviceInvalid();
+        } else {
+          this.error = err.msg || '获取数据失败，请检查网络';
+        }
       } finally {
         this.loading = false;
       }
     },
-	startPolling() {
-	  if (this.pollingTimer) return;
-	  console.log('启用轮询降级');
-	  this.pollingTimer = setInterval(() => {
-		if (!this.loading) {
-		  this.fetchData();   // 复用原有的 HTTP 获取数据方法
-		}
-	  }, 5000);   // 5秒轮询
-	},
 
-	stopPolling() {
-	  if (this.pollingTimer) {
-		clearInterval(this.pollingTimer);
-		this.pollingTimer = null;
-		console.log('停止轮询');
-	  }
-	},
-    // ========== WebSocket STOMP 协议实现 ==========
+    // 处理设备无效的情况（被删除或不存在）
+    handleDeviceInvalid() {
+      if (this.fallbackLock) return;
+      this.fallbackLock = true;
+      uni.showToast({ title: '当前设备可能已被删除，正在为您切换到可用设备', icon: 'none', duration: 2000 });
+      // 刷新设备列表后重新选择最活跃设备
+      this.fetchDeviceList().then(() => {
+        if (this.deviceOptions.length > 0) {
+          const mostActive = this.deviceOptions[0].value;
+          if (mostActive !== this.selectedDeviceKey) {
+            this.selectedDeviceKey = mostActive;
+            this.selectedIndex = 0;
+            this.selectedDeviceLabel = this.deviceOptions[0].label;
+            this.onDeviceChange(this.selectedDeviceKey);
+          }
+        }
+        this.fallbackLock = false;
+      }).catch(() => {
+        this.fallbackLock = false;
+      });
+    },
+
+    // 启动数据超时检测（10秒无数据自动降级）
+    startDataTimeoutTimer() {
+      this.stopDataTimeoutTimer();
+      this.dataTimeoutTimer = setTimeout(() => {
+        this.onDataTimeout();
+      }, this.dataTimeoutDuration);
+    },
+
+    // 重置数据超时检测（收到数据时调用）
+    resetDataTimeoutTimer() {
+      if (this.dataTimeoutTimer) {
+        clearTimeout(this.dataTimeoutTimer);
+        this.dataTimeoutTimer = setTimeout(() => {
+          this.onDataTimeout();
+        }, this.dataTimeoutDuration);
+      }
+    },
+
+    // 停止数据超时检测
+    stopDataTimeoutTimer() {
+      if (this.dataTimeoutTimer) {
+        clearTimeout(this.dataTimeoutTimer);
+        this.dataTimeoutTimer = null;
+      }
+    },
+
+    // 数据超时回调：切换到最活跃设备
+    onDataTimeout() {
+      if (this.fallbackLock) return;
+      if (!this.selectedDeviceKey || this.deviceOptions.length === 0) return;
+
+      const mostActiveKey = this.deviceOptions[0].value;
+      // 如果当前设备就是最活跃设备，不再切换，但给出提示
+      if (this.selectedDeviceKey === mostActiveKey) {
+        uni.showToast({ title: '当前设备长时间无数据，请检查设备状态', icon: 'none', duration: 2000 });
+        return;
+      }
+
+      this.fallbackLock = true;
+      uni.showToast({ title: '当前设备长时间无数据，已为您切换到最新活跃设备', icon: 'none', duration: 2000 });
+      this.selectedDeviceKey = mostActiveKey;
+      this.selectedIndex = 0;
+      this.selectedDeviceLabel = this.deviceOptions[0].label;
+      this.onDeviceChange(this.selectedDeviceKey);
+      // 延迟解锁，避免短时间内重复触发
+      setTimeout(() => {
+        this.fallbackLock = false;
+      }, 2000);
+    },
+
+    // ========== WebSocket 连接与订阅 ==========
     connectWebSocket() {
+      if (!this.selectedDeviceKey) return;
       if (this.socketTask && this.socketTask.readyState === 1) {
         console.log('WebSocket 已连接，无需重复连接');
         return;
       }
       if (this.connecting) return;
-      
+
       this.connecting = true;
       this.error = null;
-      
-      // 创建 WebSocket 连接
+
       this.socketTask = uni.connectSocket({
         url: WS_BASE_URL,
-        success: () => {
-          console.log('WebSocket 连接创建成功');
-        },
+        success: () => console.log('WebSocket 连接创建成功'),
         fail: (err) => {
           console.error('WebSocket 连接创建失败', err);
           this.handleConnectionError();
         }
       });
-      
-      // 监听打开事件
+
       this.socketTask.onOpen(() => {
         console.log('WebSocket 连接已打开');
         this.connecting = false;
         this.reconnectAttempts = 0;
-        // 连接成功后发送 STOMP CONNECT 帧
-        this.sendStompConnect();
-		this.stopPolling();        // 连接成功，停止轮询
+        if (this.socketTask) {
+          this.sendStompConnect();
+        }
+        this.stopPolling();
       });
-      
-      // 监听消息事件
+
       this.socketTask.onMessage((res) => {
         this.handleStompMessage(res.data);
       });
-      
-      // 监听错误事件
+
       this.socketTask.onError((err) => {
         console.error('WebSocket 错误', err);
         this.handleConnectionError();
-		this.startPolling();       // 连接错误，启动轮询降级
+        this.startPolling();
       });
-      
-      // 监听关闭事件
+
       this.socketTask.onClose(() => {
         console.log('WebSocket 连接已关闭');
         this.socketTask = null;
         this.connecting = false;
-		this.startPolling();       // 连接关闭，启动轮询降级
-        // 非主动断开时尝试重连
+        this.startPolling();
         if (this.reconnectTimer === null) {
           this.reconnectWebSocket();
         }
       });
     },
-    
-    // 发送 STOMP CONNECT 帧
+
     sendStompConnect() {
       const connectFrame = 'CONNECT\naccept-version:1.1,1.0\nheart-beat:10000,10000\n\n\0';
-      this.socketTask.send({
-        data: connectFrame,
-        fail: (err) => console.error('发送 CONNECT 失败', err)
-      });
+      this.socketTask.send({ data: connectFrame, fail: (err) => console.error('发送 CONNECT 失败', err) });
     },
-    
-    // 发送 STOMP SUBSCRIBE 帧
+
     sendStompSubscribe() {
-      const subscribeFrame = 'SUBSCRIBE\nid:sub-0\ndestination:/topic/environment\nack:auto\n\n\0';
-      this.socketTask.send({
-        data: subscribeFrame,
-        fail: (err) => console.error('发送 SUBSCRIBE 失败', err)
-      });
+      // 动态订阅当前设备的主题
+      const topic = `/topic/environment/${this.selectedDeviceKey}`;
+      const subscribeFrame = `SUBSCRIBE\nid:sub-0\ndestination:${topic}\nack:auto\n\n\0`;
+      this.socketTask.send({ data: subscribeFrame, fail: (err) => console.error('发送 SUBSCRIBE 失败', err) });
     },
-    
-    // 处理接收到的 STOMP 消息（解析帧）
+
     handleStompMessage(data) {
-      // 将数据追加到缓冲区
       this.stompFrameBuffer += data;
-      // 按帧结束符 \0 分割
       let nullIndex;
       while ((nullIndex = this.stompFrameBuffer.indexOf('\0')) !== -1) {
         const frameStr = this.stompFrameBuffer.substring(0, nullIndex);
         this.stompFrameBuffer = this.stompFrameBuffer.substring(nullIndex + 1);
         if (frameStr.trim().length === 0) continue;
-        
-        // 解析帧
+
         const lines = frameStr.split('\n');
         const command = lines[0];
-        
-        // 处理 CONNECTED 响应
+
         if (command === 'CONNECTED') {
           console.log('STOMP 连接成功，发送订阅');
           this.sendStompSubscribe();
-        }
-        // 处理 MESSAGE 帧
-        else if (command === 'MESSAGE') {
-          // 查找空行分隔的 body
+        } else if (command === 'MESSAGE') {
           const bodyStartIndex = frameStr.indexOf('\n\n');
           if (bodyStartIndex !== -1) {
             let body = frameStr.substring(bodyStartIndex + 2);
-            // 移除末尾的 \0 (已经在分割时去掉)
             try {
               const messageData = JSON.parse(body);
               console.log('收到推送数据:', messageData);
               this.environmentData = messageData;
+              // 收到推送数据，重置超时计时器
+              this.resetDataTimeoutTimer();
               if (this.error) this.error = null;
-              // 检查是否匹配等待的指令
               this.checkPendingCommand(messageData);
             } catch (e) {
               console.error('解析推送 JSON 失败', e, body);
             }
           }
-        }
-        // 处理 ERROR 帧
-        else if (command === 'ERROR') {
+        } else if (command === 'ERROR') {
           console.error('STOMP 错误帧:', frameStr);
           this.error = '实时数据连接出错，将尝试重连';
           this.disconnectWebSocket();
           this.reconnectWebSocket();
         }
-        // 处理 RECEIPT 等可忽略
       }
     },
-    
-    // 检查推送数据是否匹配等待的指令
+
     checkPendingCommand(data) {
       if (!this.pendingCommand) return;
-      
       const { deviceType, action } = this.pendingCommand;
       let statusChanged = false;
-      
       if (deviceType === 'fan') {
         const newStatus = data.fanStatus;
         const expected = action === 'on' ? 1 : 0;
@@ -396,40 +620,26 @@ export default {
         const expected = action === 'on' ? 1 : 0;
         if (newStatus === expected) statusChanged = true;
       }
-      
       if (statusChanged) {
-        // 清除超时定时器
-        if (this.commandTimeout) {
-          clearTimeout(this.commandTimeout);
-          this.commandTimeout = null;
-        }
-        // 清除等待状态
+        if (this.commandTimeout) clearTimeout(this.commandTimeout);
         const deviceName = deviceType === 'fan' ? '散热器' : 'LED';
-        uni.showToast({
-          title: `${deviceName}${action === 'on' ? '开启' : '关闭'}成功`,
-          icon: 'success'
-        });
+        uni.showToast({ title: `${deviceName}${action === 'on' ? '开启' : '关闭'}成功`, icon: 'success' });
         this.pendingCommand = null;
-        // 重置对应的 loading 标志
         if (deviceType === 'fan') this.fanLoading = false;
         else this.ledLoading = false;
       }
     },
-    
-    // 处理连接错误并尝试重连
+
     handleConnectionError() {
       this.error = '实时数据连接失败，正在尝试重连...';
       this.connecting = false;
       if (this.socketTask) {
-        try {
-          this.socketTask.close({});
-        } catch (e) {}
+        try { this.socketTask.close({}); } catch (e) {}
         this.socketTask = null;
       }
       this.reconnectWebSocket();
     },
-    
-    // 指数退避重连
+
     reconnectWebSocket() {
       if (this.reconnectTimer) return;
       const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
@@ -440,60 +650,64 @@ export default {
         this.reconnectTimer = null;
       }, delay);
     },
-    
-    // 主动断开 WebSocket
+
     disconnectWebSocket() {
       if (this.socketTask) {
         try {
-          // 发送 DISCONNECT 帧（可选）
           const disconnectFrame = 'DISCONNECT\n\n\0';
-          this.socketTask.send({
-            data: disconnectFrame,
-            fail: () => {}
-          });
+          this.socketTask.send({ data: disconnectFrame, fail: () => {} });
           this.socketTask.close({});
         } catch (e) {}
         this.socketTask = null;
       }
       this.connecting = false;
       this.stompFrameBuffer = '';
-      if (this.reconnectTimer) {
-        clearTimeout(this.reconnectTimer);
-        this.reconnectTimer = null;
+      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    },
+
+    startPolling() {
+      if (this.pollingTimer) return;
+      console.log('启用轮询降级');
+      this.pollingTimer = setInterval(() => {
+        if (!this.loading && this.selectedDeviceKey) {
+          this.fetchData();
+        }
+      }, 5000);
+    },
+
+    stopPolling() {
+      if (this.pollingTimer) {
+        clearInterval(this.pollingTimer);
+        this.pollingTimer = null;
+        console.log('停止轮询');
       }
     },
-    
+
     // ========== 设备反控 ==========
     async controlRadiator(action) {
-      if (!this.environmentData) {
-        uni.showToast({ title: '设备信息未加载', icon: 'none' });
+      if (!this.selectedDeviceKey) {
+        uni.showToast({ title: '请先选择设备', icon: 'none' });
         return;
       }
-      // 已有等待指令，不允许重复操作
       if (this.pendingCommand) {
         uni.showToast({ title: '请等待上一次指令执行完成', icon: 'none' });
         return;
       }
-      
-      const deviceId = this.environmentData.deviceId;
       this.fanLoading = true;
-      
       try {
         const res = await request({
           url: '/service/deviceOption/control',
           method: 'POST',
           data: {
             deviceType: 'fan',
-            deviceId: deviceId,
+            deviceKey: this.selectedDeviceKey,
             command: action
           },
           timeout: 3000
         });
         if (res.code === 20000) {
-          // 设置等待确认
           this.pendingCommand = { deviceType: 'fan', action };
           uni.showToast({ title: '指令已发送，等待设备响应...', icon: 'none', duration: 2000 });
-          // 设置超时（5秒）
           this.commandTimeout = setTimeout(() => {
             if (this.pendingCommand && this.pendingCommand.deviceType === 'fan') {
               uni.showToast({ title: '设备响应超时，请检查网络或设备状态', icon: 'none' });
@@ -511,27 +725,24 @@ export default {
         this.fanLoading = false;
       }
     },
-    
+
     async controlLed(action) {
-      if (!this.environmentData) {
-        uni.showToast({ title: '设备信息未加载', icon: 'none' });
+      if (!this.selectedDeviceKey) {
+        uni.showToast({ title: '请先选择设备', icon: 'none' });
         return;
       }
       if (this.pendingCommand) {
         uni.showToast({ title: '请等待上一次指令执行完成', icon: 'none' });
         return;
       }
-      
-      const deviceId = this.environmentData.deviceId;
       this.ledLoading = true;
-      
       try {
         const res = await request({
           url: '/service/deviceOption/control',
           method: 'POST',
           data: {
             deviceType: 'led',
-            deviceId: deviceId,
+            deviceKey: this.selectedDeviceKey,
             command: action
           },
           timeout: 3000
@@ -561,6 +772,64 @@ export default {
 </script>
 
 <style scoped>
+/* 原有样式保持不变，新增空设备卡片样式 */
+.device-card {
+  margin-bottom: 20rpx;
+}
+.picker-display {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background-color: #f5f5f5;
+  padding: 20rpx;
+  border-radius: 12rpx;
+  font-size: 28rpx;
+}
+.arrow {
+  font-size: 24rpx;
+  color: #999;
+}
+.search-box {
+  display: flex;
+  margin-top: 20rpx;
+  gap: 20rpx;
+}
+.search-box input {
+  flex: 1;
+  background-color: #f5f5f5;
+  padding: 16rpx 24rpx;
+  border-radius: 48rpx;
+  font-size: 28rpx;
+}
+.search-box button {
+  width: auto;
+  padding: 0 24rpx;
+  font-size: 28rpx;
+}
+.empty-card {
+  margin-top: 20rpx;
+}
+.empty-device-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60rpx 0;
+}
+.empty-icon {
+  font-size: 80rpx;
+  margin-bottom: 20rpx;
+  color: #e6a23c;
+}
+.empty-text {
+  font-size: 28rpx;
+  color: #909399;
+  margin-bottom: 30rpx;
+}
+.refresh-list-btn {
+  width: 200rpx;
+  margin-top: 20rpx;
+}
 /* 全局变量 */
 :root {
   --primary-color: #409eff;

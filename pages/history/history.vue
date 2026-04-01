@@ -1,5 +1,32 @@
 <template>
   <view class="history-container">
+    <!-- 设备选择卡片 -->
+    <view class="card device-card">
+      <view class="card-header">
+        <text>设备选择</text>
+      </view>
+      <view class="card-body">
+        <picker
+          mode="selector"
+          :range="deviceOptions"
+          :range-key="'label'"
+          :value="selectedIndex"
+          @change="onDevicePickerChange"
+          :disabled="deviceLoading"
+        >
+          <view class="picker-display">
+            <text>{{ selectedDeviceKey ? (selectedDeviceLabel || '请选择设备') : '请选择设备' }}</text>
+            <text class="arrow">▼</text>
+          </view>
+        </picker>
+        <!-- 可选搜索框（如需搜索可取消注释） -->
+        <!-- <view class="search-box">
+          <input type="text" v-model="searchKeyword" placeholder="输入设备ID或名称搜索" @confirm="searchDevices" @input="onSearchInput" />
+          <button @click="searchDevices" size="mini" type="primary">搜索</button>
+        </view> -->
+      </view>
+    </view>
+
     <!-- 顶部传感器 Tab -->
     <scroll-view scroll-x class="sensor-tabs" :scroll-with-animation="true">
       <view class="tab-list">
@@ -54,7 +81,7 @@
       </view>
     </view>
 
-    <!-- 图表区域 - 使用 qiun-data-charts 组件 -->
+    <!-- 图表区域 -->
     <view class="chart-card">
       <view class="chart-header">
         <view class="chart-title">{{ currentSensorLabel }}变化趋势</view>
@@ -71,7 +98,7 @@
       </view>
       <view class="chart-container">
         <qiun-data-charts
-		  :key="chartType"
+          :key="chartType"
           :type="chartType"
           :opts="chartOpts"
           :chartData="chartData"
@@ -120,6 +147,15 @@ export default {
   components: { QiunDataCharts, QiunLoading },
   data() {
     return {
+      // 设备相关
+      deviceOptions: [],        // [{ value: 'deviceKey', label: 'deviceName - deviceKey' }]
+      selectedDeviceKey: null,  // 当前选中的设备Key
+      selectedIndex: -1,        // picker 选中索引
+      selectedDeviceLabel: '',  // 当前显示的标签
+      deviceLoading: false,     // 设备列表加载中
+      searchKeyword: '',        // 搜索关键词（可选）
+      searchTimer: null,        // 搜索防抖定时器
+
       sensorTypes: [
         { label: '温度', value: 'temperature', unit: '°C' },
         { label: '湿度', value: 'humidity', unit: '%' },
@@ -137,35 +173,32 @@ export default {
       currentRange: 'all',
       customStartTime: null,
       customEndTime: null,
-      // uCharts 2.x 柱状图类型是 'column' 不是 'bar'
       chartType: 'line',
-      // 图表数据和配置
       chartData: {},
       chartOpts: {
         color: ["#409eff"],
         padding: [15, 15, 0, 5],
-        enableScroll: false, // true:开启滚动；false:关闭滚动
-		dataLabel: false,  // true:开启图表上的数据值标签；false:关闭图表上的数据值标签
-		dataPointShape: false,  // true:显示所有数据点标识；false:隐藏所有数据点标识
-		legend: {
-			show: false,          // true:启用图例；false:关闭图例
-			position: 'top',     // 图例位置：top / bottom / left / right
-			align: 'center',     // 对齐方式：left / center / right（在水平位置时有效）
-			lineHeight: 20,      // 行高（单位px）
-			fontSize: 12,        // 字体大小
-			fontColor: '#666',   // 字体颜色
-			borderWidth: 0,      // 边框宽度
-			borderColor: '#ccc', // 边框颜色
-			padding: 10,         // 内边距
-			margin: 10,          // 外边距
-			backgroundColor: 'rgba(255,255,255,0.9)', // 背景色
-			// 还可以设置自定义图例项的形状、样式等
-		},
+        enableScroll: false,
+        dataLabel: false,
+        dataPointShape: false,
+        legend: {
+          show: false,
+          position: 'top',
+          align: 'center',
+          lineHeight: 20,
+          fontSize: 12,
+          fontColor: '#666',
+          borderWidth: 0,
+          borderColor: '#ccc',
+          padding: 10,
+          margin: 10,
+          backgroundColor: 'rgba(255,255,255,0.9)',
+        },
         xAxis: {
           disableGrid: true,
           rotateLabel: true,
-		  labelCount: 5,      // 强制只显示5个刻度标签
-		  itemCount: 300,     // 显示数据点数量
+          labelCount: 5,
+          itemCount: 300,
           fontSize: 10
         },
         yAxis: {
@@ -216,20 +249,116 @@ export default {
     }
   },
   mounted() {
-    this.fetchHistory();
+    // 页面挂载时加载设备列表，加载完成后自动选中第一个设备（在 fetchDeviceList 中处理）
+    this.fetchDeviceList();
+  },
+  onShow() {
+    // 每次显示时，如果已有设备但设备列表可能变化，可重新加载（可选）
+    // 为避免频繁刷新，可保留此逻辑，但注意防抖
+    // this.fetchDeviceList();
+  },
+  onHide() {
+    if (this.searchTimer) clearTimeout(this.searchTimer);
   },
   methods: {
-    // 切换图表类型
-    switchChartType(type) {
-      this.chartType = type;
+    // ========== 设备列表 ==========
+    async fetchDeviceList(keyword = '') {
+      this.deviceLoading = true;
+      try {
+        const res = await request({
+          url: '/service/device/getDeviceSelect',
+          method: 'get',
+          params: { keyword }
+        });
+        // 兼容多种返回结构
+        let deviceArray = [];
+        if (res.code === 20000 && Array.isArray(res.data)) {
+          deviceArray = res.data;
+        } else if (Array.isArray(res)) {
+          deviceArray = res;
+        } else if (res.data && Array.isArray(res.data.list)) {
+          deviceArray = res.data.list;
+        }
+        this.deviceOptions = deviceArray.map(item => ({
+          value: item.deviceKey,
+          label: `${item.deviceName || '未命名'} (${item.deviceKey})`
+        }));
+
+        // 默认选中第一个设备
+        if (this.deviceOptions.length > 0 && !this.selectedDeviceKey) {
+          const first = this.deviceOptions[0];
+          this.selectedDeviceKey = first.value;
+          this.selectedIndex = 0;
+          this.selectedDeviceLabel = first.label;
+          this.onDeviceChange(this.selectedDeviceKey);
+        } else {
+          // 没有设备时清空
+          this.selectedDeviceKey = null;
+          this.selectedIndex = -1;
+          this.selectedDeviceLabel = '';
+          this.historyList = [];
+          this.displayList = [];
+          this.chartData = {};
+        }
+      } catch (err) {
+        console.error('获取设备列表失败', err);
+        uni.showToast({ title: '设备列表加载失败', icon: 'none' });
+      } finally {
+        this.deviceLoading = false;
+      }
     },
-    
+
+    // 搜索设备（可选）
+    searchDevices() {
+      this.fetchDeviceList(this.searchKeyword);
+    },
+    onSearchInput(e) {
+      clearTimeout(this.searchTimer);
+      this.searchTimer = setTimeout(() => {
+        this.searchDevices();
+      }, 300);
+    },
+
+    // picker 选择变化
+    onDevicePickerChange(e) {
+      const idx = e.detail.value;
+      if (idx >= 0 && idx < this.deviceOptions.length) {
+        const selected = this.deviceOptions[idx];
+        this.selectedDeviceKey = selected.value;
+        this.selectedIndex = idx;
+        this.selectedDeviceLabel = selected.label;
+        this.onDeviceChange(this.selectedDeviceKey);
+      } else {
+        this.selectedDeviceKey = null;
+        this.selectedIndex = -1;
+        this.selectedDeviceLabel = '';
+        this.onDeviceChange(null);
+      }
+    },
+
+    // 设备切换时重置数据并重新加载历史
+    onDeviceChange(deviceKey) {
+      if (!deviceKey) {
+        this.historyList = [];
+        this.displayList = [];
+        this.chartData = {};
+        return;
+      }
+      this.resetAndFetch(); // 重新获取历史数据
+    },
+
+    // ========== 原有历史数据逻辑 ==========
     async fetchHistory() {
+      if (!this.selectedDeviceKey) {
+        // 没有选中设备时不清空，等待设备选中
+        return;
+      }
       this.loading = true;
       try {
         const params = {
           begin: this.getStartTime(),
-          end: this.getEndTime()
+          end: this.getEndTime(),
+          deviceKey: this.selectedDeviceKey   // 关键：添加设备筛选参数
         };
         const res = await request({
           url: '/service/environment/statistics',
@@ -240,7 +369,6 @@ export default {
           this.historyList = res.data || [];
           this.currentPage = 1;
           this.updateDisplayList();
-          // 更新图表数据
           this.updateChartData();
         } else {
           uni.showToast({ title: res.msg || '获取数据失败', icon: 'none' });
@@ -251,58 +379,58 @@ export default {
         this.loading = false;
       }
     },
-    
+
     // 更新图表数据
-	updateChartData() {
-	  if (this.historyList.length === 0) {
-	    this.chartData = {};
-	    return;
-	  }
-	 // 按测量时间升序排序
-	  const sortedData = [...this.historyList].sort((a, b) => 
-	    new Date(a.gmtMeasurement) - new Date(b.gmtMeasurement)
-	  );
-	 
-	  // 限制数据点数量，避免图表过于拥挤（最多显示20个点）
-	  const maxPoints = 300;
-	  const step = Math.ceil(sortedData.length / maxPoints);
-	  const sampledData = sortedData.filter((_, index) => index % step === 0).slice(0, maxPoints);
-	 
-	  const categories = sampledData.map(item => this.formatTimeShort(item.gmtMeasurement));
-	  const seriesData = sampledData.map(item => {
-	    const val = item[this.currentSensor];
-	    return val !== undefined ? val : 0;
-	  });
-	 
-	  this.chartData = {
-	    categories: categories,
-	    series: [{
-		  name: this.currentSensorLabel+"("+this.currentUnit+")",
-		  data: seriesData
-	    }]
-	  };
-	},
+    updateChartData() {
+      if (this.historyList.length === 0) {
+        this.chartData = {};
+        return;
+      }
+      const sortedData = [...this.historyList].sort((a, b) => 
+        new Date(a.gmtMeasurement) - new Date(b.gmtMeasurement)
+      );
+      const maxPoints = 300;
+      const step = Math.ceil(sortedData.length / maxPoints);
+      const sampledData = sortedData.filter((_, index) => index % step === 0).slice(0, maxPoints);
+
+      const categories = sampledData.map(item => this.formatTimeShort(item.gmtMeasurement));
+      const seriesData = sampledData.map(item => {
+        const val = item[this.currentSensor];
+        return val !== undefined ? val : 0;
+      });
+
+      this.chartData = {
+        categories: categories,
+        series: [{
+          name: this.currentSensorLabel + "(" + this.currentUnit + ")",
+          data: seriesData
+        }]
+      };
+    },
 
     updateDisplayList() {
       const start = 0;
       const end = this.currentPage * this.pageSize;
       this.displayList = this.historyList.slice(start, end);
     },
-    
+
     loadMore() {
       if (this.hasMore && !this.loading) {
         this.currentPage++;
         this.updateDisplayList();
       }
     },
+
     resetAndFetch() {
+      // 重置分页，重新获取数据
+      this.currentPage = 1;
       this.fetchHistory();
     },
-    
+
     switchSensor(sensor) {
       this.currentSensor = sensor;
     },
-    
+
     switchRange(range) {
       this.currentRange = range;
       this.customStartTime = null;
@@ -311,7 +439,7 @@ export default {
       this.customStartDate = '';
       this.customEndDate = '';
     },
-    
+
     getStartTime() {
       if (this.customStartTime) {
         return this.formatToBackendDatetime(this.customStartTime);
@@ -337,7 +465,7 @@ export default {
           return '';
       }
     },
-    
+
     getEndTime() {
       if (this.customEndTime) {
         return this.formatToBackendDatetime(this.customEndTime);
@@ -354,7 +482,7 @@ export default {
           return '';
       }
     },
-    
+
     formatToBackendDatetime(date) {
       let d = date;
       if (typeof date === 'string') {
@@ -371,13 +499,13 @@ export default {
       const seconds = String(d.getSeconds()).padStart(2, '0');
       return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
     },
-    
+
     formatDate(date) {
       if (!date) return '';
       const d = new Date(date);
       return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
     },
-    
+
     formatTime(dateStr) {
       if (!dateStr) return '';
       const date = new Date(dateStr);
@@ -389,7 +517,7 @@ export default {
       const second = date.getSeconds();
       return `${year}-${month}-${day} ${hour}:${minute.toString().padStart(2, '0')}:${second.toString().padStart(2, '0')}`;
     },
-    
+
     formatTimeShort(dateStr) {
       if (!dateStr) return '';
       const date = new Date(dateStr);
@@ -401,27 +529,28 @@ export default {
       const second = date.getSeconds();
       return `${month}-${day} ${hour}:${minute.toString().padStart(2, '0')}:${second.toString().padStart(2, '0')}`;
     },
+
     getValueBySensor(item) {
       const val = item[this.currentSensor];
       return val !== undefined ? val : '--';
     },
-    
+
     showDetail(item) {
       uni.showModal({
         title: '详细信息',
-        content: `时间：${item.gmtMeasurement}\n${this.currentSensorLabel}：${this.getValueBySensor(item)} ${this.currentUnit}`,
+        content: `设备：${this.selectedDeviceLabel}\n时间：${item.gmtMeasurement}\n${this.currentSensorLabel}：${this.getValueBySensor(item)} ${this.currentUnit}`,
         showCancel: false
       });
     },
-    
+
     onStartDateChange(e) {
       this.customStartDate = e.detail.value;
     },
-    
+
     onEndDateChange(e) {
       this.customEndDate = e.detail.value;
     },
-    
+
     confirmCustomDate() {
       if (!this.customStartDate || !this.customEndDate) {
         uni.showToast({ title: '请选择完整的日期范围', icon: 'none' });
@@ -434,6 +563,10 @@ export default {
       this.customStartTime = start;
       this.customEndTime = end;
       this.showCustomDate = false;
+    },
+
+    switchChartType(type) {
+      this.chartType = type;
     }
   }
 };
@@ -445,11 +578,61 @@ export default {
   min-height: 100vh;
   padding-bottom: 30rpx;
 }
+/* 设备选择卡片样式 */
+.device-card {
+  background-color: #fff;
+  border-radius: 24rpx;
+  margin: 20rpx;
+  margin-bottom: 0;
+  overflow: hidden;
+}
+.device-card .card-header {
+  padding: 24rpx 32rpx;
+  border-bottom: 1rpx solid #f0f0f0;
+  font-size: 32rpx;
+  font-weight: 600;
+  color: #303133;
+}
+.device-card .card-body {
+  padding: 20rpx 32rpx 32rpx;
+}
+.picker-display {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background-color: #f5f5f5;
+  padding: 20rpx;
+  border-radius: 12rpx;
+  font-size: 28rpx;
+}
+.arrow {
+  font-size: 24rpx;
+  color: #999;
+}
+.search-box {
+  display: flex;
+  margin-top: 20rpx;
+  gap: 20rpx;
+}
+.search-box input {
+  flex: 1;
+  background-color: #f5f5f5;
+  padding: 16rpx 24rpx;
+  border-radius: 48rpx;
+  font-size: 28rpx;
+}
+.search-box button {
+  width: auto;
+  padding: 0 24rpx;
+  font-size: 28rpx;
+}
+
 .sensor-tabs {
   background-color: #fff;
   white-space: nowrap;
   border-bottom: 1px solid #f0f0f0;
   padding: 0 20rpx;
+  margin-top: 20rpx;
 }
 .tab-list {
   display: inline-flex;

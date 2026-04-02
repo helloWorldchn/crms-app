@@ -147,7 +147,12 @@
         <!-- 散热器控制 -->
         <view class="control-row">
           <view class="control-icon">
-            <text :class="['fan-icon', environmentData && environmentData.fanStatus === 1 ? 'fan-animate' : '']">🌀</text>
+            <image 
+              :src="fanIcon" 
+              class="fan-icon-img" 
+              :class="environmentData && environmentData.fanStatus === 1 ? 'fan-animate' : 'fan-static'"
+              mode="aspectFit"
+            />
           </view>
           <view class="control-info">
             <view class="control-label">散热器</view>
@@ -169,7 +174,18 @@
         <!-- LED 控制 -->
         <view class="control-row">
           <view class="control-icon">
-            <text :class="['led-icon', environmentData && environmentData.ledStatus === 1 ? 'led-on-glow' : '']">💡</text>
+            <image 
+              v-if="environmentData && environmentData.ledStatus === 1"
+              :src="ledOnIcon" 
+              class="led-icon-img led-on-glow"
+              mode="aspectFit"
+            />
+            <image 
+              v-else
+              :src="ledOffIcon" 
+              class="led-icon-img"
+              mode="aspectFit"
+            />
           </view>
           <view class="control-info">
             <view class="control-label">LED灯</view>
@@ -206,6 +222,10 @@ const WS_BASE_URL = 'ws://192.168.1.21:8080/ws/environment/websocket';
 export default {
   data() {
     return {
+      // 图标路径
+      fanIcon: '/static/icons/fan.png',
+      ledOnIcon: '/static/icons/led-on.png',
+      ledOffIcon: '/static/icons/led-off.png',
       // 设备相关
       deviceOptions: [],        // [{ value: 'deviceKey', label: 'deviceName - deviceKey' }]
       selectedDeviceKey: null,  // 当前选中的设备Key
@@ -682,47 +702,6 @@ export default {
 </script>
 
 <style scoped>
-/* 样式保持不变（与之前相同） */
-.device-card {
-  margin-bottom: 20rpx;
-}
-.picker-display {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  background-color: #f5f5f5;
-  padding: 20rpx;
-  border-radius: 12rpx;
-  font-size: 28rpx;
-}
-.arrow {
-  font-size: 24rpx;
-  color: #999;
-}
-.empty-card {
-  margin-top: 20rpx;
-}
-.empty-device-wrapper {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 60rpx 0;
-}
-.empty-icon {
-  font-size: 80rpx;
-  margin-bottom: 20rpx;
-  color: #e6a23c;
-}
-.empty-text {
-  font-size: 28rpx;
-  color: #909399;
-  margin-bottom: 30rpx;
-}
-.refresh-list-btn {
-  width: 200rpx;
-  margin-top: 20rpx;
-}
 /* 全局变量 */
 :root {
   --primary-color: #409eff;
@@ -769,6 +748,26 @@ export default {
   padding: 24rpx 32rpx 32rpx;
 }
 
+/* 设备选择器 */
+.device-card {
+  margin-bottom: 20rpx;
+}
+
+.picker-display {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background-color: #f5f5f5;
+  padding: 20rpx;
+  border-radius: 12rpx;
+  font-size: 28rpx;
+}
+
+.arrow {
+  font-size: 24rpx;
+  color: #999;
+}
+
 /* 刷新按钮 */
 .refresh-btn {
   font-size: 28rpx;
@@ -791,6 +790,36 @@ export default {
 .refresh-btn.loading {
   opacity: 0.6;
   pointer-events: none;
+}
+
+/* 空设备提示 */
+.empty-card {
+  margin-top: 20rpx;
+}
+
+.empty-device-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60rpx 0;
+}
+
+.empty-icon {
+  font-size: 80rpx;
+  margin-bottom: 20rpx;
+  color: #e6a23c;
+}
+
+.empty-text {
+  font-size: 28rpx;
+  color: #909399;
+  margin-bottom: 30rpx;
+}
+
+.refresh-list-btn {
+  width: 200rpx;
+  margin-top: 20rpx;
 }
 
 /* 数据行：使用 Grid 布局，响应式 */
@@ -952,25 +981,36 @@ button[disabled] {
   pointer-events: none;
 }
 
-/* 图标动画 */
-.fan-icon, .led-icon {
+/* 风扇图片样式 */
+.fan-icon-img {
+  width: 60rpx;
+  height: 60rpx;
   display: inline-block;
-  font-size: 60rpx;
-  transition: all 0.2s;
 }
 
 .fan-animate {
   animation: spin 1s linear infinite;
 }
 
-@keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
+.fan-static {
+  opacity: 0.5;
+  filter: grayscale(100%);
+}
+
+/* LED图片样式 */
+.led-icon-img {
+  width: 60rpx;
+  height: 60rpx;
+  display: inline-block;
 }
 
 .led-on-glow {
-  text-shadow: 0 0 12rpx #ffb347;
   filter: drop-shadow(0 0 8rpx #ffb347);
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 /* 加载与错误状态 */

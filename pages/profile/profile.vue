@@ -58,7 +58,8 @@ export default {
       try {
         uni.showLoading({ title: '加载中...', mask: true });
         const res = await request({
-          url: '/index/info',   // 使用后端提供的接口
+          // url: '/index/info',   // 使用后端提供的接口
+          url: '/admin/acl/index/info',   // 使用后端提供的接口
           method: 'GET'
         });
         if (res.data) {

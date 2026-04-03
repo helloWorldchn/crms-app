@@ -54,7 +54,8 @@ export default {
       try {
         // 假设后端登录接口为 /auth/login，返回 { code:20000, data:{ token } }
         const res = await request({
-          url: '/index/login',
+          // url: '/index/login',
+          url: '/admin/acl/login',
           method: 'POST',
           data: {
             username: this.username,
